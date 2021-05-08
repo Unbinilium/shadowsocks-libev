@@ -57,6 +57,7 @@
 #include "plugin.h"
 #include "server.h"
 #include "winsock.h"
+#include "resolv.h"
 
 #ifndef EAGAIN
 #define EAGAIN EWOULDBLOCK
@@ -108,6 +109,10 @@ static void resolv_free_cb(void *data);
 
 int verbose    = 0;
 int reuse_port = 0;
+int tcp_incoming_sndbuf = 0;
+int tcp_incoming_rcvbuf = 0;
+int tcp_outgoing_sndbuf = 0;
+int tcp_outgoing_rcvbuf = 0;
 
 int is_bind_local_addr = 0;
 struct sockaddr_storage local_addr_v4;
@@ -470,6 +475,14 @@ connect_to_remote(EV_P_ struct addrinfo *res,
 #endif
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    if (tcp_outgoing_sndbuf > 0) {
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+    }
+
+    if (tcp_outgoing_rcvbuf > 0) {
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
+    }
+
     // setup remote socks
 
     if (setnonblocking(sockfd) == -1)
@@ -478,10 +491,12 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     if (is_bind_local_addr) {
         struct sockaddr_storage *local_addr =
             res->ai_family == AF_INET ? &local_addr_v4 : &local_addr_v6;
-        if (bind_to_addr(local_addr, sockfd) == -1) {
-            ERROR("bind_to_addr");
-            close(sockfd);
-            return NULL;
+        if (res->ai_family == local_addr->ss_family) {
+            if (bind_to_addr(local_addr, sockfd) == -1) {
+                ERROR("bind_to_addr");
+                FATAL("cannot bind socket");
+                return NULL;
+            }
         }
     }
 
@@ -500,7 +515,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
     if (fast_open) {
 #if defined(MSG_FASTOPEN) && !defined(TCP_FASTOPEN_CONNECT)
         int s = -1;
-        s = sendto(sockfd, server->buf->data, server->buf->len,
+        s = sendto(sockfd, server->buf->data + server->buf->idx, server->buf->len,
                    MSG_FASTOPEN, res->ai_addr, res->ai_addrlen);
 #elif defined(TCP_FASTOPEN_WINSOCK)
         DWORD s   = -1;
@@ -529,8 +544,8 @@ connect_to_remote(EV_P_ struct addrinfo *res,
             memset(&remote->olap, 0, sizeof(remote->olap));
             remote->connect_ex_done = 0;
             if (ConnectEx(sockfd, res->ai_addr, res->ai_addrlen,
-                          server->buf->data, server->buf->len,
-                          &s, &remote->olap)) {
+                          server->buf->data + server->buf->idx,
+                          server->buf->len, &s, &remote->olap)) {
                 remote->connect_ex_done = 1;
                 break;
             }
@@ -568,7 +583,7 @@ connect_to_remote(EV_P_ struct addrinfo *res,
         FATAL("fast open is not enabled in this build");
 #endif
         if (s == 0)
-            s = send(sockfd, server->buf->data, server->buf->len, 0);
+            s = send(sockfd, server->buf->data + server->buf->idx, server->buf->len, 0);
 #endif
         if (s == -1) {
             if (errno == CONNECT_IN_PROGRESS) {
@@ -652,10 +667,10 @@ setTosFromConnmark(remote_t *remote, server_t *server)
         socklen_t len;
         struct sockaddr_storage sin;
         len = sizeof(sin);
-        if (getsockname(remote->fd, (struct sockaddr *)&sin, &len) == 0) {
+        if (getpeername(remote->fd, (struct sockaddr *)&sin, &len) == 0) {
             struct sockaddr_storage from_addr;
             len = sizeof from_addr;
-            if (getpeername(remote->fd, (struct sockaddr *)&from_addr, &len) == 0) {
+            if (getsockname(remote->fd, (struct sockaddr *)&from_addr, &len) == 0) {
                 if ((server->tracker = (struct dscptracker *)ss_malloc(sizeof(struct dscptracker)))) {
                     if ((server->tracker->ct = nfct_new())) {
                         // Build conntrack query SELECT
@@ -706,8 +721,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         buf    = remote->buf;
 
         // Only timer the watcher if a valid connection is established
-        int timeout = max(MIN_TCP_IDLE_TIMEOUT, server->listen_ctx->timeout);
-        ev_timer_set(&server->recv_ctx->watcher, timeout, timeout);
         ev_timer_again(EV_A_ & server->recv_ctx->watcher);
     }
 
@@ -908,7 +921,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             return;
         } else {
             server->buf->len -= offset;
-            memmove(server->buf->data, server->buf->data + offset, server->buf->len);
+            server->buf->idx = offset;
         }
 
         if (verbose) {
@@ -1114,8 +1127,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
-    int timeout = max(MIN_TCP_IDLE_TIMEOUT, server->listen_ctx->timeout);
-    ev_timer_set(&server->recv_ctx->watcher, timeout, timeout);
     ev_timer_again(EV_A_ & server->recv_ctx->watcher);
 
     ssize_t r = recv(remote->fd, server->buf->data, SOCKET_BUF_SIZE, 0);
@@ -1396,12 +1407,11 @@ new_server(int fd, listen_ctx_t *listener)
     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
 
-    int request_timeout = min(MAX_REQUEST_TIMEOUT, listener->timeout);
-
+    int timeout = max(MIN_TCP_IDLE_TIMEOUT, server->listen_ctx->timeout);
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
     ev_timer_init(&server->recv_ctx->watcher, server_timeout_cb,
-                  request_timeout, request_timeout);
+                  timeout, timeout);
 
     cork_dllist_add(&connections, &server->entries);
 
@@ -1540,6 +1550,15 @@ accept_cb(EV_P_ ev_io *w, int revents)
 #ifdef SO_NOSIGPIPE
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
+
+    if (tcp_incoming_sndbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+    }
+
+    if (tcp_incoming_rcvbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+    }
+
     setnonblocking(serverfd);
 
     server_t *server = new_server(serverfd, listener);
@@ -1573,10 +1592,16 @@ main(int argc, char **argv)
     int server_num = 0;
     ss_addr_t server_addr[MAX_REMOTE_NUM];
     memset(server_addr, 0, sizeof(ss_addr_t) * MAX_REMOTE_NUM);
+    memset(&local_addr_v4, 0, sizeof(struct sockaddr_storage));
+    memset(&local_addr_v6, 0, sizeof(struct sockaddr_storage));
 
     static struct option long_options[] = {
         { "fast-open",       no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
         { "reuse-port",      no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
         { "no-delay",        no_argument,       NULL, GETOPT_VAL_NODELAY     },
         { "acl",             required_argument, NULL, GETOPT_VAL_ACL         },
         { "manager-address", required_argument, NULL,
@@ -1634,14 +1659,25 @@ main(int argc, char **argv)
         case GETOPT_VAL_REUSE_PORT:
             reuse_port = 1;
             break;
+        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+            tcp_incoming_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+            tcp_incoming_rcvbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+            tcp_outgoing_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+            tcp_outgoing_rcvbuf = atoi(optarg);
+            break;
         case 's':
             if (server_num < MAX_REMOTE_NUM) {
                 parse_addr(optarg, &server_addr[server_num++]);
             }
             break;
         case 'b':
-            if (parse_local_addr(&local_addr_v4, &local_addr_v6, optarg) == 0)
-                is_bind_local_addr = 1;
+            is_bind_local_addr += parse_local_addr(&local_addr_v4, &local_addr_v6, optarg);
             break;
         case 'p':
             server_port = optarg;
@@ -1761,16 +1797,27 @@ main(int argc, char **argv)
         if (reuse_port == 0) {
             reuse_port = conf->reuse_port;
         }
+        if (tcp_incoming_sndbuf == 0) {
+            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+        }
+        if (tcp_incoming_rcvbuf == 0) {
+            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+        }
+        if (tcp_outgoing_sndbuf == 0) {
+            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+        }
+        if (tcp_outgoing_rcvbuf == 0) {
+            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
+        }
         if (fast_open == 0) {
             fast_open = conf->fast_open;
         }
         if (is_bind_local_addr == 0) {
-            if (parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr) == 0)
-                is_bind_local_addr = 1;
-            if (parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr_v4) == 0)
-                is_bind_local_addr = 1;
-            if (parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr_v6) == 0)
-                is_bind_local_addr = 1;
+            is_bind_local_addr += parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr);
+        }
+        if (is_bind_local_addr == 0) {
+            is_bind_local_addr += parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr_v4);
+            is_bind_local_addr += parse_local_addr(&local_addr_v4, &local_addr_v6, conf->local_addr_v6);
         }
 #ifdef HAVE_SETRLIMIT
         if (nofile == 0) {
@@ -1787,6 +1834,38 @@ main(int argc, char **argv)
             LOGI("initializing acl...");
             acl = !init_acl(conf->acl);
         }
+    }
+
+    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_sndbuf = 0;
+    }
+
+    if (tcp_incoming_sndbuf != 0) {
+        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+    }
+
+    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_rcvbuf = 0;
+    }
+
+    if (tcp_incoming_rcvbuf != 0) {
+        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+    }
+
+    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_sndbuf = 0;
+    }
+
+    if (tcp_outgoing_sndbuf != 0) {
+        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+    }
+
+    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_rcvbuf = 0;
+    }
+
+    if (tcp_outgoing_rcvbuf != 0) {
+        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
     }
 
     if (server_num == 0) {
@@ -1994,7 +2073,7 @@ main(int argc, char **argv)
 
             // Bind to port
             int listenfd;
-            listenfd = create_and_bind(host, server_port, mptcp);
+            listenfd = create_and_bind(host, port, mptcp);
             if (listenfd == -1) {
                 continue;
             }

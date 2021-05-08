@@ -55,8 +55,6 @@
 #include "utils.h"
 #include "socks5.h"
 #include "acl.h"
-#include "http.h"
-#include "tls.h"
 #include "plugin.h"
 #include "local.h"
 #include "winsock.h"
@@ -81,6 +79,10 @@
 
 int verbose    = 0;
 int reuse_port = 0;
+int tcp_incoming_sndbuf = 0;
+int tcp_incoming_rcvbuf = 0;
+int tcp_outgoing_sndbuf = 0;
+int tcp_outgoing_rcvbuf = 0;
 
 #ifdef __ANDROID__
 int vpn        = 0;
@@ -88,7 +90,6 @@ uint64_t tx    = 0;
 uint64_t rx    = 0;
 ev_tstamp last = 0;
 
-int is_remote_dns = 1; // resolve hostname remotely
 char *stat_path   = NULL;
 #endif
 
@@ -431,48 +432,17 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
         return -1;
     }
 
-    size_t abuf_len  = abuf->len;
-    int sni_detected = 0;
-    int hostname_len = 0;
-
-    char *hostname;
-    uint16_t dst_port = load16_be(abuf->data + abuf->len - 2);
-
-    if (atyp == SOCKS5_ATYP_IPV4 || atyp == SOCKS5_ATYP_IPV6) {
-        if (dst_port == http_protocol->default_port)
-            hostname_len = http_protocol->parse_packet(buf->data + 3 + abuf->len,
-                                                       buf->len - 3 - abuf->len, &hostname);
-        else if (dst_port == tls_protocol->default_port)
-            hostname_len = tls_protocol->parse_packet(buf->data + 3 + abuf->len,
-                                                      buf->len - 3 - abuf->len, &hostname);
-        if (hostname_len == -1 && buf->len < SOCKET_BUF_SIZE && server->stage != STAGE_SNI) {
-            if (server_handshake_reply(EV_A_ w, 0, &response) < 0)
-                return -1;
-            server->stage = STAGE_SNI;
-            ev_timer_start(EV_A_ & server->delayed_connect_watcher);
-            return -1;
-        } else if (hostname_len > 0) {
-            sni_detected = 1;
-            if (acl || verbose) {
-                hostname_len = hostname_len > MAX_HOSTNAME_LEN ? MAX_HOSTNAME_LEN : hostname_len;
-                memcpy(host, hostname, hostname_len);
-                host[hostname_len] = '\0';
-            }
-            ss_free(hostname);
-        }
-    }
-
     if (server_handshake_reply(EV_A_ w, 0, &response) < 0)
         return -1;
     server->stage = STAGE_STREAM;
 
-    buf->len -= (3 + abuf_len);
+    buf->len -= (3 + abuf->len);
     if (buf->len > 0) {
-        memmove(buf->data, buf->data + 3 + abuf_len, buf->len);
+        memmove(buf->data, buf->data + 3 + abuf->len, buf->len);
     }
 
     if (verbose) {
-        if (sni_detected || atyp == SOCKS5_ATYP_DOMAIN)
+        if (atyp == SOCKS5_ATYP_DOMAIN)
             LOGI("connect to %s:%s", host, port);
         else if (atyp == SOCKS5_ATYP_IPV4)
             LOGI("connect to %s:%s", ip, port);
@@ -492,7 +462,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
         int err;
 
         int host_match = 0;
-        if (sni_detected || atyp == SOCKS5_ATYP_DOMAIN)
+        if (atyp == SOCKS5_ATYP_DOMAIN)
             host_match = acl_match_host(host);
 
         if (host_match > 0)
@@ -546,7 +516,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
 
         if (bypass) {
             if (verbose) {
-                if (sni_detected || atyp == SOCKS5_ATYP_DOMAIN)
+                if (atyp == SOCKS5_ATYP_DOMAIN)
                     LOGI("bypass %s:%s", host, port);
                 else if (atyp == 1)
                     LOGI("bypass %s:%s", ip, port);
@@ -572,22 +542,6 @@ not_bypass:
     // Not bypass
     if (remote == NULL) {
         remote = create_remote(server->listener, NULL, 0);
-
-        if (sni_detected && acl
-#ifdef __ANDROID__
-            && is_remote_dns
-#endif
-            ) {
-            // Reconstruct address buffer
-            abuf->len               = 0;
-            abuf->data[abuf->len++] = 3;
-            abuf->data[abuf->len++] = hostname_len;
-            memcpy(abuf->data + abuf->len, host, hostname_len);
-            abuf->len += hostname_len;
-            dst_port   = htons(dst_port);
-            memcpy(abuf->data + abuf->len, &dst_port, 2);
-            abuf->len += 2;
-        }
     }
 
     if (remote == NULL) {
@@ -614,7 +568,7 @@ not_bypass:
     server->remote = remote;
     remote->server = server;
 
-    if (buf->len > 0 || sni_detected) {
+    if (buf->len > 0) {
         return 0;
     } else {
         ev_timer_start(EV_A_ & server->delayed_connect_watcher);
@@ -924,8 +878,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
             buf->len = 0;
             return;
-        } else if (server->stage == STAGE_HANDSHAKE ||
-                   server->stage == STAGE_SNI) {
+        } else if (server->stage == STAGE_HANDSHAKE) {
             int ret = server_handshake(EV_A_ w, buf);
             if (ret)
                 return;
@@ -1351,6 +1304,14 @@ create_remote(listen_ctx_t *listener,
         }
     }
 
+    if (tcp_outgoing_sndbuf > 0) {
+        setsockopt(remotefd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+    }
+
+    if (tcp_outgoing_rcvbuf > 0) {
+        setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
+    }
+
     // Setup
     setnonblocking(remotefd);
 #ifdef SET_INTERFACE
@@ -1441,6 +1402,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
+    if (tcp_incoming_sndbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+    }
+
+    if (tcp_incoming_rcvbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+    }
+
     server_t *server = new_server(serverfd);
     server->listener = listener;
 
@@ -1481,6 +1450,10 @@ main(int argc, char **argv)
 
     static struct option long_options[] = {
         { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
         { "fast-open",   no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
         { "no-delay",    no_argument,       NULL, GETOPT_VAL_NODELAY     },
         { "acl",         required_argument, NULL, GETOPT_VAL_ACL         },
@@ -1499,7 +1472,7 @@ main(int argc, char **argv)
     USE_TTY();
 
 #ifdef __ANDROID__
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:S:huUvV6AD",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:S:huUvV6A",
                             long_options, NULL)) != -1) {
 #else
     while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUv6A",
@@ -1536,6 +1509,18 @@ main(int argc, char **argv)
             break;
         case GETOPT_VAL_REUSE_PORT:
             reuse_port = 1;
+            break;
+        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+            tcp_incoming_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+            tcp_incoming_rcvbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+            tcp_outgoing_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+            tcp_outgoing_rcvbuf = atoi(optarg);
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
@@ -1598,9 +1583,6 @@ main(int argc, char **argv)
 #ifdef __ANDROID__
         case 'S':
             stat_path = optarg;
-            break;
-        case 'D':
-            is_remote_dns = 0;
             break;
         case 'V':
             vpn = 1;
@@ -1667,6 +1649,18 @@ main(int argc, char **argv)
         if (reuse_port == 0) {
             reuse_port = conf->reuse_port;
         }
+        if (tcp_incoming_sndbuf == 0) {
+            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+        }
+        if (tcp_incoming_rcvbuf == 0) {
+            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+        }
+        if (tcp_outgoing_sndbuf == 0) {
+            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+        }
+        if (tcp_outgoing_rcvbuf == 0) {
+            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
+        }
         if (fast_open == 0) {
             fast_open = conf->fast_open;
         }
@@ -1718,6 +1712,38 @@ main(int argc, char **argv)
 #ifdef __MINGW32__
     winsock_init();
 #endif
+
+    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_sndbuf = 0;
+    }
+
+    if (tcp_incoming_sndbuf != 0) {
+        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+    }
+
+    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_rcvbuf = 0;
+    }
+
+    if (tcp_incoming_rcvbuf != 0) {
+        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+    }
+
+    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_sndbuf = 0;
+    }
+
+    if (tcp_outgoing_sndbuf != 0) {
+        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+    }
+
+    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_rcvbuf = 0;
+    }
+
+    if (tcp_outgoing_rcvbuf != 0) {
+        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
+    }
 
     if (plugin != NULL) {
         uint16_t port = get_local_port();
